@@ -1,9 +1,8 @@
 import os
 import unittest
 
-
 requires_posix = unittest.skipUnless(os.name == "posix", "Requires POSIX")
-
+requires_nt = unittest.skipUnless(os.name == 'nt', 'Requires NT')
 
 class PbsTestSuite(unittest.TestCase):
     @requires_posix
@@ -144,6 +143,32 @@ class PbsTestSuite(unittest.TestCase):
 
         self.assertTrue(len(actual_out) != 0)
 
+    @requires_nt
+    def test_nt_internal_commands(self):
+        from pbs import ECHO
+        
+        s1 = unicode(ECHO("test")).strip()
+        s2 = 'test'
+        self.assertEqual(s1, s2)
+        
+    @requires_nt
+    def test_nt_internal_commands_pipe(self):
+        from pbs import dir, find
+        # dir /b /a | find /c /v ""
+        c1 = int(find(dir("/b", "/a"),'/c', '/v','\\"\\"'))
+        c2 = len(os.listdir('.'))
+        self.assertEqual(c1, c2)
+        
+    @requires_nt
+    def test_nt_extranl_command(self):
+        from pbs import ipconfig, ErrorReturnCode_1
+        try:
+            ret = ipconfig("/?")
+        except Exception as err:
+            # windows program fails with err 1, on help [/?] weird...
+            self.assertIn("/?" , err.full_cmd)
+            self.assertIn("Display this help message" , err.stdout)
+        
     @requires_posix
     def test_subcommand(self):
         from pbs import time

@@ -372,3 +372,21 @@ The Command wrapper is also useful for commands that are not in your standard PA
 script = Command("/tmp/temporary-script.sh")
 print script()
 ```
+
+## Windows Support
+PBS now index the internal command from cmd.exe (i.e. at, dir, call, goto and etc.)
+and automaticly search for *.exe command in the path
+
+and now this is also possible:
+
+```python
+from pbs import ipconfig
+print ipconfig("/all")
+```
+
+and internal commands:
+
+```python
+from pbs import dir
+print dir("*.c")
+```

@@ -113,12 +113,11 @@ def resolve_program(program):
         # that from python (we have to use underscores), so we'll check
         # if a dash version of our underscore command exists and use that
         # if it does
-        if "_" in program: path = which(program.replace("_", "-"))        
+        if "_" in program: path = which(program.replace("_", "-"))
+        if os.name == "nt": path = which("%s.exe" % program)  
         if not path: return None
     return path
-
-
-
+    
 class RunningCommand(object):
     def __init__(self, command_ran, process, call_args, stdin=None):
         self.command_ran = command_ran
@@ -241,7 +240,12 @@ class Command(object):
     @classmethod
     def _create(cls, program):
         path = resolve_program(program)
-        if not path: raise CommandNotFound(program)
+        if not path:
+            # handle nt internal commands
+            if os.name == 'nt' and program.lower() in nt_internal_command:
+                return getattr(cls("cmd.exe").bake("/s", "/c"), program)
+                
+            else: raise CommandNotFound(program)
         return cls(path)
     
     def __init__(self, path):            
@@ -308,7 +312,7 @@ class Command(object):
                 else: arg = "--%s=%s" % (k, v)
             processed_args.append(arg)
 
-        processed_args = shlex.split(" ".join(processed_args))
+        processed_args = shlex.split(" ".join(processed_args), posix=True)
         return processed_args
  
     
@@ -346,7 +350,7 @@ class Command(object):
         args = list(args)
 
         cmd = []
-
+        
         # aggregate any with contexts
         for prepend in self._prepend_stack: cmd.extend(prepend)
 
@@ -422,16 +426,16 @@ class Command(object):
             
         if call_args["err_to_out"]: stderr = subp.STDOUT
             
+        if os.name == 'nt':
+            # on windows avoid passing via subprocess.list2cmdline
+            # it's casuing a havoc when parameter with quotes are needed
+            cmd = " ".join(cmd)
+
         # leave shell=False
         process = subp.Popen(cmd, shell=False, env=os.environ,
             stdin=stdin, stdout=stdout, stderr=stderr)
 
         return RunningCommand(command_ran, process, call_args, actual_stdin)
-
-
-
-
-
 
 
 # this class is used directly when we do a "from pbs import *".  it allows
@@ -507,7 +511,18 @@ Please import pbs or import programs individually.")
 
 
 
-
+nt_internal_command = None
+if os.name == "nt":
+    import re
+    def get_nt_internal_command():
+        ''' find all internal commands via help command'''
+        regex = re.compile('''([A-Z][A-Z]*)\s''')
+        cmd = Command("cmd.exe")
+        help_string = str( cmd("/K", "help", ) )
+        ret =  [ int_cmd.lower() for int_cmd in regex.findall(str(help_string)) ]
+        return ret
+    nt_internal_command = get_nt_internal_command()
+    
 
 def run_repl(env):
     banner = "\n>> PBS v{version}\n>> https://github.com/amoffat/pbs\n"
@@ -564,3 +579,4 @@ if __name__ == "__main__":
 else:
     self = sys.modules[__name__]
     sys.modules[__name__] = SelfWrapper(self)
+    
