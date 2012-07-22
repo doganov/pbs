@@ -27,24 +27,22 @@ import sys
 import traceback
 import os
 import re
-from glob import glob
-import shlex
+from glob import glob as original_glob
 from types import ModuleType
 from functools import partial
+import warnings
 
 
 
-__version__ = "0.94"
+__version__ = "0.107"
 __project_url__ = "https://github.com/amoffat/pbs"
 
-IS_PY3 = sys.version_info[0] >= 3
-if IS_PY3: 
+IS_PY3 = sys.version_info[0] == 3
+if IS_PY3:
     raw_input = input
-    from io import IOBase
-    file_type = IOBase
+    unicode = str
 else:
-    file_type = file
-
+    pass
 
 
 
@@ -80,12 +78,13 @@ rc_exc_regex = re.compile("ErrorReturnCode_(\d+)")
 rc_exc_cache = {}
 
 def get_rc_exc(rc):
+    rc = int(rc)
     try: return rc_exc_cache[rc]
     except KeyError: pass
     
     name = "ErrorReturnCode_%d" % rc
     exc = type(name, (ErrorReturnCode,), {})
-    rc_exc_cache[name] = exc
+    rc_exc_cache[rc] = exc
     return exc
 
 
@@ -117,7 +116,14 @@ def resolve_program(program):
         if os.name == "nt": path = which("%s.exe" % program)  
         if not path: return None
     return path
-    
+
+
+def glob(arg):    
+    return original_glob(arg) or arg
+
+
+
+
 class RunningCommand(object):
     def __init__(self, command_ran, process, call_args, stdin=None):
         self.command_ran = command_ran
@@ -135,10 +141,9 @@ class RunningCommand(object):
         if self.call_args["with"]: return
 
         # run and block
+        if stdin: stdin = stdin.encode("utf8")
         self._stdout, self._stderr = self.process.communicate(stdin)
-        rc = self.process.wait()
-
-        if rc != 0: raise get_rc_exc(rc)(self.command_ran, self._stdout, self._stderr)
+        self._handle_exit_code(self.process.wait())
 
     def __enter__(self):
         # we don't actually do anything here because anything that should
@@ -150,27 +155,33 @@ class RunningCommand(object):
     def __exit__(self, typ, value, traceback):
         if self.call_args["with"] and Command._prepend_stack:
             Command._prepend_stack.pop()
-   
+            
     def __str__(self):
         if IS_PY3: return self.__unicode__()
-        else: return unicode(self).encode("utf-8")
+        else: return unicode(self).encode("utf8")
         
     def __unicode__(self):
-        if self.process: 
-            if self.stdout: return self.stdout.decode("utf-8") # byte string
+        if self.process:
+            if self.call_args["bg"]: self.wait()
+            if self._stdout: return self.stdout
             else: return ""
 
     def __eq__(self, other):
-        return str(self) == str(other)
+        return unicode(self) == unicode(other)
 
     def __contains__(self, item):
         return item in str(self)
 
     def __getattr__(self, p):
-        return getattr(str(self), p)
+        # let these three attributes pass through to the Popen object
+        if p in ("send_signal", "terminate", "kill"):
+            if self.process: return getattr(self.process, p)
+            else: raise AttributeError
+        return getattr(unicode(self), p)
      
     def __repr__(self):
-        return str(self)
+        return "<RunningCommand %r, pid:%d, special_args:%r" % (
+            self.command_ran, self.process.pid, self.call_args)
 
     def __long__(self):
         return long(str(self).strip())
@@ -184,44 +195,26 @@ class RunningCommand(object):
     @property
     def stdout(self):
         if self.call_args["bg"]: self.wait()
-        return self._stdout
+        return self._stdout.decode("utf8", "replace")
     
     @property
     def stderr(self):
         if self.call_args["bg"]: self.wait()
-        return self._stderr
+        return self._stderr.decode("utf8", "replace")
 
     def wait(self):
         if self.process.returncode is not None: return
         self._stdout, self._stderr = self.process.communicate()
-        rc = self.process.wait()
-
-        if rc != 0: raise get_rc_exc(rc)(self.stdout, self.stderr)
-        return self
+        self._handle_exit_code(self.process.wait())
+        return str(self)
+    
+    def _handle_exit_code(self, rc):
+        if rc not in self.call_args["ok_code"]:
+            raise get_rc_exc(rc)(self.command_ran, self._stdout, self._stderr)
     
     def __len__(self):
         return len(str(self))
 
-
-
-class BakedCommand(object):
-    def __init__(self, cmd, attr):
-        self._cmd = cmd
-        self._attr = attr
-        self._partial = partial(cmd, attr)
-        
-    def __call__(self, *args, **kwargs):
-        return self._partial(*args, **kwargs)
-        
-    def __str__(self):
-        if IS_PY3: return self.__unicode__()
-        else: return unicode(self).encode("utf-8")
-
-    def __repr__(self):
-        return str(self)
-        
-    def __unicode__(self):
-        return "%s %s" % (self._cmd, self._attr)
 
 
 
@@ -235,6 +228,12 @@ class Command(object):
         "out": None, # redirect STDOUT
         "err": None, # redirect STDERR
         "err_to_out": None, # redirect STDERR to STDOUT
+        "in": None,
+        "env": os.environ,
+        
+        # this is for commands that may have a different exit status than the
+        # normal 0.  this can either be an integer or a list/tuple of ints
+        "ok_code": 0,
     }
 
     @classmethod
@@ -257,21 +256,9 @@ class Command(object):
     def __getattribute__(self, name):
         # convenience
         getattr = partial(object.__getattribute__, self)
-        
-        # the logic here is, if an attribute starts with an
-        # underscore, always try to find it, because it's very unlikely
-        # that a first command will start with an underscore, example:
-        # "git _command" will probably never exist.
-
-        # after that, we check to see if the attribute actually exists
-        # on the Command object, but only return that if we're not
-        # a baked object.
-        if name.startswith("_"): return getattr(name)
-        try: attr = getattr(name)
-        except AttributeError: return BakedCommand(self, name)
-
-        if self._partial: return BakedCommand(self, name)
-        return attr
+        if name.startswith("_"): return getattr(name)  
+        if name == "bake": return getattr("bake")     
+        return getattr("bake")(name)
 
     
     @staticmethod
@@ -286,33 +273,38 @@ class Command(object):
         return call_args, kwargs
 
 
-    @staticmethod
-    def _compile_args(args, kwargs):
+    def _format_arg(self, arg):
+        if IS_PY3: arg = str(arg)
+        else: arg = unicode(arg).encode("utf8")
+        return arg
+
+    def _compile_args(self, args, kwargs):
         processed_args = []
                 
         # aggregate positional args
         for arg in args:
             if isinstance(arg, (list, tuple)):
-                for sub_arg in arg: processed_args.append(str(sub_arg))
-            else: processed_args.append(str(arg))
+                if not arg:
+                    warnings.warn("Empty list passed as an argument to %r. \
+If you're using glob.glob(), please use pbs.glob() instead." % self.path, stacklevel=3)
+                for sub_arg in arg: processed_args.append(self._format_arg(sub_arg))
+            else: processed_args.append(self._format_arg(arg))
 
         # aggregate the keyword arguments
         for k,v in kwargs.items():
             # we're passing a short arg as a kwarg, example:
             # cut(d="\t")
             if len(k) == 1:
-                if v is True: arg = "-"+k
-                else: arg = "-%s %r" % (k, v)
+                processed_args.append("-"+k)
+                if v is not True: processed_args.append(self._format_arg(v))
 
             # we're doing a long arg
             else:
                 k = k.replace("_", "-")
 
-                if v is True: arg = "--"+k
-                else: arg = "--%s=%s" % (k, v)
-            processed_args.append(arg)
+                if v is True: processed_args.append("--"+k)
+                else: processed_args.append("--%s=%s" % (k, self._format_arg(v)))
 
-        processed_args = shlex.split(" ".join(processed_args), posix=True)
         return processed_args
  
     
@@ -320,9 +312,19 @@ class Command(object):
         fn = Command(self._path)
         fn._partial = True
 
-        fn._partial_call_args, kwargs = self._extract_call_args(kwargs)
-        processed_args = self._compile_args(args, kwargs)
-        fn._partial_baked_args = processed_args
+        call_args, kwargs = self._extract_call_args(kwargs)
+        
+        pruned_call_args = call_args
+        for k,v in Command.call_args.items():
+            try:
+                if pruned_call_args[k] == v:
+                    del pruned_call_args[k]
+            except KeyError: continue
+        
+        fn._partial_call_args.update(self._partial_call_args)
+        fn._partial_call_args.update(pruned_call_args)
+        fn._partial_baked_args.extend(self._partial_baked_args)
+        fn._partial_baked_args.extend(self._compile_args(args, kwargs))
         return fn
        
     def __str__(self):
@@ -336,6 +338,11 @@ class Command(object):
         baked_args = " ".join(self._partial_baked_args)
         if baked_args: baked_args = " " + baked_args
         return self._path + baked_args
+        
+    def __eq__(self, other):
+        try: return str(self) == str(other)
+        except: return False
+    
 
     def __enter__(self):
         Command._prepend_stack.append([self._path])
@@ -361,6 +368,11 @@ class Command(object):
         call_args.update(self._partial_call_args)
                 
 
+        # here we normalize the ok_code to be something we can do
+        # "if return_code in call_args["ok_code"]" on
+        if not isinstance(call_args["ok_code"], (tuple, list)):
+            call_args["ok_code"] = [call_args["ok_code"]]
+
         # set pipe to None if we're outputting straight to CLI
         pipe = None if call_args["fg"] else subp.PIPE
         
@@ -384,19 +396,6 @@ class Command(object):
 
         # makes sure our arguments are broken up correctly
         split_args = self._partial_baked_args + processed_args
-
-        # we used to glob, but now we don't.  the reason being, escaping globs
-        # doesn't work.  also, adding a _noglob attribute doesn't allow the
-        # flexibility to glob some args and not others.  so we have to leave
-        # the globbing up to the user entirely
-        #=======================================================================
-        # # now glob-expand each arg and compose the final list
-        # final_args = []
-        # for arg in split_args:
-        #    expanded = glob(arg)
-        #    if expanded: final_args.extend(expanded)
-        #    else: final_args.append(arg)
-        #=======================================================================
         final_args = split_args
 
         cmd.extend(final_args)
@@ -410,18 +409,24 @@ class Command(object):
             return RunningCommand(command_ran, None, call_args)
         
         
+        # stdin from string
+        input = call_args["in"]
+        if input:
+            actual_stdin = input
+        
         # stdout redirection
         stdout = pipe
         out = call_args["out"]
         if out:
-            if isinstance(out, file_type): stdout = out
+            if hasattr(out, "write"): stdout = out
             else: stdout = open(str(out), "w")
         
         # stderr redirection
         stderr = pipe
         err = call_args["err"]
+        
         if err:
-            if isinstance(err, file_type): stderr = err
+            if hasattr(err, "write"): stderr = err
             else: stderr = open(str(err), "w")
             
         if call_args["err_to_out"]: stderr = subp.STDOUT
@@ -432,7 +437,7 @@ class Command(object):
             cmd = " ".join(cmd)
 
         # leave shell=False
-        process = subp.Popen(cmd, shell=False, env=os.environ,
+        process = subp.Popen(cmd, shell=False, env=call_args["env"],
             stdin=stdin, stdout=stdout, stderr=stderr)
 
         return RunningCommand(command_ran, process, call_args, actual_stdin)
